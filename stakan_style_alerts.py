@@ -1,0 +1,567 @@
+"""
+Stakan-style crypto alert bot
+=============================
+
+Monitors ALL Binance USDT spot pairs every 30 seconds and sends a Telegram
+alert on either of these signals:
+
+  REVERSAL + VOLUME     - price was trending green (up) over the last
+                   FLIP_LOOKBACK_MINUTES, then the most recent poll
+                   interval turns red, AND volume over the last hour
+                   is elevated at least FLIP_VOLUME_MULTIPLIER vs the
+                   hour before it -> SELL alert.
+                   The mirror case (red trend -> green flip, same
+                   volume confirmation) -> BUY alert.
+
+  CONTINUATION + VOLUME - price was already trending in one direction
+                   over FLIP_LOOKBACK_MINUTES, and the most recent poll
+                   interval keeps moving the SAME direction (no flip),
+                   AND volume is elevated at least CONTINUATION_VOLUME_MULTIPLIER
+                   -> CONTINUATION UP or CONTINUATION DOWN alert. This
+                   uses a stricter volume bar than reversals, to keep
+                   continuation alerts less frequent. Useful for trend-
+                   following instead of catching reversals.
+
+HOW VOLUME IS MEASURED
+-----------------------
+Earlier versions of this script estimated volume by diffing Binance's
+rolling 24h ticker "volume" field between polls. That field is a rolling
+trailing-24h window, not a running counter, so the diff is noisy and
+frequently ~0 even during real trading activity - a design flaw, not a
+"needs more time" issue.
+
+This version fixes that with a two-stage approach:
+  1. Every cycle, one cheap call (`/api/v3/ticker/24hr`, all symbols at
+     once) tracks price only, and finds symbols with a real price trend
+     or flip - this part is free and instant.
+  2. Only for those few candidates, a real 5-minute kline is fetched
+     (`/api/v3/klines`) - kline volume is the true volume traded in that
+     exact window, not a rolling estimate - to confirm the volume spike
+     before alerting. This keeps API usage low (a handful of calls per
+     cycle, not 480) while giving accurate volume data.
+
+SETUP (local testing)
+----------------------
+1. pip install requests flask
+2. Create a Telegram bot via @BotFather, get the bot token.
+3. Get your chat_id: message your bot once, then visit
+   https://api.telegram.org/bot<TOKEN>/getUpdates and read "chat":{"id":...}
+4. Set the two environment variables below (or edit the constants directly):
+     export TG_BOT_TOKEN="123456:ABC-your-token"
+     export TG_CHAT_ID="123456789"
+   For multiple recipients, use TG_CHAT_IDS instead (comma-separated):
+     export TG_CHAT_IDS="123456789,987654321"
+5. Run: python3 stakan_style_alerts.py
+   This starts a small web server (health check for hosting platforms)
+   plus the bot loop in a background thread.
+
+Adjust the THRESHOLDS section to taste.
+"""
+
+import os
+import io
+import time
+import logging
+import requests
+from collections import defaultdict, deque
+from datetime import datetime
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ----------------------------- CONFIG ------------------------------------
+
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+# Comma-separated list of chat ids to send alerts to, e.g. "111111,222222,333333".
+# TG_CHAT_ID (singular) still works for a single recipient, for backward compatibility.
+TG_CHAT_IDS = [
+    c.strip() for c in os.environ.get("TG_CHAT_IDS", os.environ.get("TG_CHAT_ID", "")).split(",")
+    if c.strip()
+]
+
+CHECK_INTERVAL_SECONDS = 30               # poll every 30 seconds
+
+# ----- FLIP / CONTINUATION SIGNAL -----
+FLIP_LOOKBACK_MINUTES = 30                 # how far back to judge the prior trend
+MIN_TREND_PCT_FOR_CANDIDATE = 1.0          # ignore noise: trend must move at least this % before checking volume
+FLIP_VOLUME_MULTIPLIER = 2.0               # last 1h real volume vs the 1h just before it, for reversal alerts
+CONTINUATION_VOLUME_MULTIPLIER = 3.0       # stricter volume bar for continuation alerts specifically
+EXTENSION_BUFFER_PCT = 0.15                 # skip trades already within this fraction of the window's extreme
+                                             # (avoids buying near the top / selling near the bottom of an
+                                             # already-exhausted move - the classic "reverses right after
+                                             # entry" fakeout pattern)
+
+ALERT_COOLDOWN_SECONDS = 30 * 60           # don't re-alert same symbol+reason within this window
+KLINE_INTERVAL = "5m"                      # candle size used for the real-volume check
+KLINE_CANDLES_NEEDED = 24                  # 24 x 5m = 2h of candles (last 1h vs previous 1h)
+
+BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr"
+BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("stakan_alerts")
+
+# ----------------------------- STATE --------------------------------------
+
+# price history: symbol -> deque of (timestamp, price)
+price_history = defaultdict(lambda: deque(maxlen=(FLIP_LOOKBACK_MINUTES * 60) // CHECK_INTERVAL_SECONDS + 2))
+
+# last alert time per (symbol, reason) to avoid spam
+last_alert_time = defaultdict(lambda: 0)
+
+
+# ----------------------------- HELPERS -------------------------------------
+
+def binance_get(url, params=None, timeout=15):
+    """
+    Wrapper around requests.get that respects Binance's rate-limit /
+    IP-ban responses (429 = rate limited, 418 = IP auto-banned). Both
+    include a Retry-After header telling us how long to wait. Raises the
+    original HTTPError for anything else so callers can still handle it.
+    """
+    resp = requests.get(url, params=params, timeout=timeout)
+    if resp.status_code in (418, 429):
+        retry_after = int(resp.headers.get("Retry-After", 60))
+        log.warning(
+            "Binance returned %s (rate limited / IP ban). Waiting %ss before retrying.",
+            resp.status_code, retry_after,
+        )
+        time.sleep(retry_after)
+        resp = requests.get(url, params=params, timeout=timeout)
+    resp.raise_for_status()
+    return resp
+
+
+def get_usdt_symbols():
+    """Fetch all actively trading spot USDT pairs."""
+    resp = binance_get(BINANCE_EXCHANGE_INFO_URL, timeout=15)
+    data = resp.json()
+    symbols = set()
+    for s in data["symbols"]:
+        if (
+            s["quoteAsset"] == "USDT"
+            and s["status"] == "TRADING"
+            and s["isSpotTradingAllowed"]
+        ):
+            symbols.add(s["symbol"])
+    return symbols
+
+
+def fetch_all_tickers():
+    """One call returns 24hr stats for every symbol (used for price only)."""
+    resp = binance_get(BINANCE_TICKER_URL, timeout=20)
+    return resp.json()
+
+
+def fetch_real_volume_multiplier(symbol: str):
+    """
+    Real volume check using actual candle data (not a rolling-window
+    estimate). Returns (multiplier, last_1h_volume, prev_1h_volume, candles)
+    or (None, None, None, None) if unavailable. Candles are returned too so
+    the same fetch can be reused to draw a chart, instead of fetching twice.
+    """
+    try:
+        resp = binance_get(
+            BINANCE_KLINES_URL,
+            params={"symbol": symbol, "interval": KLINE_INTERVAL, "limit": KLINE_CANDLES_NEEDED},
+            timeout=10,
+        )
+        candles = resp.json()
+    except requests.RequestException as e:
+        log.warning("Kline fetch failed for %s: %s", symbol, e)
+        return None, None, None, None
+
+    if len(candles) < KLINE_CANDLES_NEEDED:
+        return None, None, None, None
+
+    volumes = [float(c[5]) for c in candles]
+    half = KLINE_CANDLES_NEEDED // 2
+    prev_1h_volume = sum(volumes[:half])
+    last_1h_volume = sum(volumes[half:])
+
+    if prev_1h_volume <= 0:
+        return None, last_1h_volume, prev_1h_volume, candles
+
+    return last_1h_volume / prev_1h_volume, last_1h_volume, prev_1h_volume, candles
+
+
+def generate_chart_image(symbol: str, candles) -> bytes:
+    """
+    Price + volume + order-flow-dynamics chart (PNG bytes), all built from
+    the same kline data already used for the volume check. Green if price
+    rose over the shown window, red if it fell.
+
+    The bottom "Dynamics" panel is a real candlestick strip (open/high/low/
+    close) colored and brightened by actual buy-vs-sell volume delta for
+    that candle, not by price change - matching stakan's actual logic:
+    sharp buy or sell IMBALANCE (delta) drives the color/brightness, not
+    the size of the price move itself. Binance kline data includes taker
+    buy volume per candle, so real delta = taker_buy - taker_sell, no
+    extra API calls needed.
+    """
+    times = [datetime.fromtimestamp(c[0] / 1000) for c in candles]
+    opens = [float(c[1]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    closes = [float(c[4]) for c in candles]
+    volumes = [float(c[5]) for c in candles]
+    taker_buy_volumes = [float(c[9]) for c in candles]
+
+    up = closes[-1] >= closes[0]
+    line_color = "#22c55e" if up else "#ef4444"
+    bar_color = "#86efac" if up else "#fca5a5"
+
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        3, 1, figsize=(6, 5), dpi=110,
+        gridspec_kw={"height_ratios": [3, 1, 1.2]}, sharex=True,
+    )
+    fig.patch.set_facecolor("#0f172a")
+    for ax in (ax1, ax2, ax3):
+        ax.set_facecolor("#0f172a")
+        ax.tick_params(colors="#94a3b8", labelsize=7)
+        for spine in ax.spines.values():
+            spine.set_color("#334155")
+        ax.grid(alpha=0.15, color="#94a3b8")
+
+    ax1.plot(times, closes, color=line_color, linewidth=1.6)
+    ax1.set_title(symbol, color="#e2e8f0", fontsize=11, fontweight="bold", loc="left")
+
+    ax2.bar(times, volumes, width=0.003, color=bar_color)
+    ax2.set_ylabel("Volume", color="#94a3b8", fontsize=7)
+
+    # candlestick dynamics panel: real OHLC shape (wick + body), but color
+    # and brightness are driven by buy/sell volume DELTA for that candle,
+    # not price change - net buying = green, net selling = red, and the
+    # more one-sided the delta, the more vivid it renders. Brightness is
+    # encoded as an actual dim-to-vivid color blend (not transparency,
+    # which is too subtle to read against a dark background), and a sqrt
+    # curve spreads out mid-strength deltas instead of clustering them
+    # near "dim."
+    deltas = [
+        (2 * buy_vol - total_vol)  # buy_vol - (total_vol - buy_vol)
+        for buy_vol, total_vol in zip(taker_buy_volumes, volumes)
+    ]
+    max_abs_delta = max((abs(d) for d in deltas), default=0.0)
+
+    DIM_GREEN = (0.10, 0.25, 0.16)    # muted, low-delta green
+    VIVID_GREEN = (0.20, 0.90, 0.50)  # bright, high-delta green
+    DIM_RED = (0.32, 0.12, 0.12)      # muted, low-delta red
+    VIVID_RED = (0.98, 0.30, 0.30)    # bright, high-delta red
+
+    def blend(dim, vivid, t):
+        return tuple(dim[i] + (vivid[i] - dim[i]) * t for i in range(3))
+
+    for t, o, h, l, cl, delta in zip(times, opens, highs, lows, closes, deltas):
+        ratio = (abs(delta) / max_abs_delta) if max_abs_delta > 0 else 0.0
+        ratio = ratio ** 0.5  # sqrt curve: spreads mid-range deltas apart for readability
+        candle_color = blend(DIM_GREEN, VIVID_GREEN, ratio) if delta >= 0 else blend(DIM_RED, VIVID_RED, ratio)
+        ax3.plot([t, t], [l, h], color=candle_color, linewidth=1)
+        ax3.plot([t, t], [o, cl], color=candle_color, linewidth=4, solid_capstyle="butt")
+    ax3.set_ylabel("Dynamics", color="#94a3b8", fontsize=7)
+
+    fig.autofmt_xdate(rotation=30)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def send_telegram_alert(message: str):
+    if not TG_BOT_TOKEN or not TG_CHAT_IDS:
+        log.warning("Telegram not configured, would have sent: %s", message)
+        return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    for chat_id in TG_CHAT_IDS:
+        try:
+            r = requests.post(
+                url,
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+                timeout=10,
+            )
+            if not r.ok:
+                log.error("Telegram send failed for chat %s: %s", chat_id, r.text)
+        except requests.RequestException as e:
+            log.error("Telegram send error for chat %s: %s", chat_id, e)
+
+
+def send_telegram_photo(image_bytes: bytes, caption: str):
+    """Send the alert as a photo with the message as its caption, to every
+    configured recipient. Falls back to a plain text alert for any
+    recipient whose photo send fails."""
+    if not TG_BOT_TOKEN or not TG_CHAT_IDS:
+        log.warning("Telegram not configured, would have sent: %s", caption)
+        return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+    for chat_id in TG_CHAT_IDS:
+        try:
+            r = requests.post(
+                url,
+                data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+                files={"photo": ("chart.png", image_bytes, "image/png")},
+                timeout=20,
+            )
+            if not r.ok:
+                log.error("Telegram photo send failed for chat %s: %s", chat_id, r.text)
+                send_telegram_alert_to(chat_id, caption)
+        except requests.RequestException as e:
+            log.error("Telegram photo send error for chat %s: %s", chat_id, e)
+            send_telegram_alert_to(chat_id, caption)
+
+
+def send_telegram_alert_to(chat_id: str, message: str):
+    """Send a text alert to one specific chat id (used as a fallback)."""
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    try:
+        r = requests.post(
+            url,
+            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        if not r.ok:
+            log.error("Telegram fallback send failed for chat %s: %s", chat_id, r.text)
+    except requests.RequestException as e:
+        log.error("Telegram fallback send error for chat %s: %s", chat_id, e)
+
+
+def can_alert(symbol: str, reason: str) -> bool:
+    key = f"{symbol}:{reason}"
+    now = time.time()
+    if now - last_alert_time[key] >= ALERT_COOLDOWN_SECONDS:
+        last_alert_time[key] = now
+        return True
+    return False
+
+
+# ----------------------------- CORE LOGIC ----------------------------------
+
+def process_cycle(symbols):
+    now = time.time()
+    tickers = fetch_all_tickers()
+    alerts = []
+    diagnostics = []  # (symbol, trend_pct, trend_sign, momentum_sign)
+
+    candidates = []
+
+    for t in tickers:
+        symbol = t["symbol"]
+        if symbol not in symbols:
+            continue
+
+        try:
+            last_price = float(t["lastPrice"])
+        except (KeyError, ValueError):
+            continue
+        if last_price <= 0:
+            continue
+
+        hist = price_history[symbol]
+        hist.append((now, last_price))
+        hist_list = list(hist)
+
+        if len(hist_list) < 4:
+            continue
+
+        prev_price = hist_list[-2][1]
+        prev_prev_price = hist_list[-3][1]
+        window_start_price = hist_list[0][1]
+        if window_start_price <= 0 or prev_price <= 0 or prev_prev_price <= 0:
+            continue
+
+        momentum_change = last_price - prev_price
+        prior_momentum_change = prev_price - prev_prev_price
+        trend_change = prev_price - window_start_price
+
+        raw_momentum_sign = 1 if momentum_change > 0 else (-1 if momentum_change < 0 else 0)
+        prior_momentum_sign = 1 if prior_momentum_change > 0 else (-1 if prior_momentum_change < 0 else 0)
+        # require the last TWO intervals to agree before trusting the direction -
+        # a single noisy tick shouldn't be enough to call a flip or continuation
+        momentum_sign = raw_momentum_sign if raw_momentum_sign == prior_momentum_sign and raw_momentum_sign != 0 else 0
+
+        trend_sign = 1 if trend_change > 0 else (-1 if trend_change < 0 else 0)
+        trend_pct = trend_change / window_start_price * 100
+        momentum_pct = momentum_change / prev_price * 100
+
+        diagnostics.append((symbol, trend_pct, trend_sign, momentum_sign))
+
+        if abs(trend_pct) < MIN_TREND_PCT_FOR_CANDIDATE:
+            continue
+        if trend_sign == 0 or momentum_sign == 0:
+            continue
+
+        window_prices = [px for _, px in hist_list]
+        candidates.append({
+            "symbol": symbol,
+            "last_price": last_price,
+            "trend_sign": trend_sign,
+            "momentum_sign": momentum_sign,
+            "trend_pct": trend_pct,
+            "momentum_pct": momentum_pct,
+            "window_high": max(window_prices),
+            "window_low": min(window_prices),
+        })
+
+    for c in candidates:
+        symbol = c["symbol"]
+        multiplier, last_1h_vol, prev_1h_vol, candles = fetch_real_volume_multiplier(symbol)
+        if multiplier is None:
+            continue
+
+        is_reversal = c["trend_sign"] != c["momentum_sign"]
+        is_continuation = c["trend_sign"] == c["momentum_sign"]
+
+        # extension check: is this entry already too close to the recent
+        # extreme (i.e. the move looks exhausted rather than fresh)?
+        window_range = c["window_high"] - c["window_low"]
+        if window_range > 0:
+            position_in_range = (c["last_price"] - c["window_low"]) / window_range
+        else:
+            position_in_range = 0.5
+
+        def too_extended(direction: str) -> bool:
+            # direction "up" = a BUY-type trade (BUY reversal, CONTINUATION UP):
+            #   risky if price is already near the top of the window
+            # direction "down" = a SELL-type trade (SELL reversal, CONTINUATION DOWN):
+            #   risky if price is already near the bottom of the window
+            if direction == "up":
+                return position_in_range >= (1 - EXTENSION_BUFFER_PCT)
+            return position_in_range <= EXTENSION_BUFFER_PCT
+
+        range_str = (
+            f"{FLIP_LOOKBACK_MINUTES}m range {c['window_low']:g}-{c['window_high']:g}, "
+            f"trend {c['trend_pct']:+.2f}%, last tick {c['momentum_pct']:+.2f}%, "
+            f"volume {multiplier:.1f}x vs prior hour"
+        )
+
+        def build_chart():
+            try:
+                return generate_chart_image(symbol, candles)
+            except Exception as e:
+                log.warning("Chart generation failed for %s: %s", symbol, e)
+                return None
+
+        if is_reversal and multiplier >= FLIP_VOLUME_MULTIPLIER:
+            if c["trend_sign"] > 0 and not too_extended("down") and can_alert(symbol, "flip_sell"):
+                alerts.append((
+                    f"🔴 SELL <b>{symbol}</b>: green→red flip after trending up over "
+                    f"{FLIP_LOOKBACK_MINUTES}m (now {c['last_price']:g})\n{range_str}",
+                    build_chart(),
+                ))
+            elif c["trend_sign"] < 0 and not too_extended("up") and can_alert(symbol, "flip_buy"):
+                alerts.append((
+                    f"🟢 BUY <b>{symbol}</b>: red→green flip after trending down over "
+                    f"{FLIP_LOOKBACK_MINUTES}m (now {c['last_price']:g})\n{range_str}",
+                    build_chart(),
+                ))
+        elif is_continuation and multiplier >= CONTINUATION_VOLUME_MULTIPLIER:
+            if c["trend_sign"] > 0 and not too_extended("up") and can_alert(symbol, "continue_up"):
+                alerts.append((
+                    f"🟩 CONTINUATION UP <b>{symbol}</b>: still rising after "
+                    f"{FLIP_LOOKBACK_MINUTES}m uptrend (now {c['last_price']:g})\n{range_str}",
+                    build_chart(),
+                ))
+            elif c["trend_sign"] < 0 and not too_extended("down") and can_alert(symbol, "continue_down"):
+                alerts.append((
+                    f"🟥 CONTINUATION DOWN <b>{symbol}</b>: still falling after "
+                    f"{FLIP_LOOKBACK_MINUTES}m downtrend (now {c['last_price']:g})\n{range_str}",
+                    build_chart(),
+                ))
+
+    return alerts, diagnostics
+
+
+bot_status = {"state": "starting", "symbols_monitored": 0, "last_cycle": None, "last_error": None}
+
+
+def run_bot_loop():
+    symbols = None
+    while symbols is None:
+        try:
+            log.info("Fetching tradable USDT pairs...")
+            symbols = get_usdt_symbols()
+            log.info("Monitoring %d USDT pairs", len(symbols))
+            bot_status["symbols_monitored"] = len(symbols)
+        except Exception as e:
+            log.exception("Startup failed, retrying in 10s: %s", e)
+            bot_status["last_error"] = str(e)
+            time.sleep(10)
+
+    bot_status["state"] = "running"
+
+    if TG_BOT_TOKEN and TG_CHAT_IDS:
+        send_telegram_alert(f"✅ Alert bot started, monitoring {len(symbols)} USDT pairs.")
+        log.info("Sending alerts to %d recipient(s).", len(TG_CHAT_IDS))
+    else:
+        log.warning(
+            "TG_BOT_TOKEN / TG_CHAT_IDS not set - alerts will only be logged, not sent."
+        )
+
+    while True:
+        cycle_start = time.time()
+        try:
+            alerts, diagnostics = process_cycle(symbols)
+            bot_status["last_cycle"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+            for message, chart_bytes in alerts:
+                log.info("ALERT: %s", message)
+                if chart_bytes:
+                    send_telegram_photo(chart_bytes, message)
+                else:
+                    send_telegram_alert(message)
+            if not alerts:
+                if diagnostics:
+                    top = sorted(diagnostics, key=lambda d: abs(d[1]), reverse=True)[:3]
+                    top_str = ", ".join(
+                        f"{sym} trend {pct:+.2f}%"
+                        f"{' up' if trend > 0 else (' down' if trend < 0 else ' flat')}"
+                        f"->{'up' if mom > 0 else ('down' if mom < 0 else 'flat')}"
+                        for sym, pct, trend, mom in top
+                    )
+                    log.info("Cycle complete, no alerts. Closest: %s", top_str)
+                else:
+                    log.info("Cycle complete, no alerts (still building history).")
+        except requests.RequestException as e:
+            log.error("Network/API error this cycle: %s", e)
+            bot_status["last_error"] = str(e)
+        except Exception as e:
+            log.exception("Unexpected error: %s", e)
+            bot_status["last_error"] = str(e)
+
+        elapsed = time.time() - cycle_start
+        sleep_for = max(CHECK_INTERVAL_SECONDS - elapsed, 5)
+        time.sleep(sleep_for)
+
+
+# ----------------------------- WEB WRAPPER ---------------------------------
+# Render's free tier only keeps "web services" alive (things that answer
+# HTTP requests) - plain background scripts aren't supported on the free
+# plan. This tiny Flask app exists purely so Render treats the bot as a web
+# service; the actual bot logic runs in a background thread. Pair this with
+# a free uptime pinger (e.g. UptimeRobot) hitting "/" every ~10 minutes so
+# Render never puts it to sleep.
+
+def create_app():
+    from flask import Flask, jsonify
+    app = Flask(__name__)
+
+    @app.route("/")
+    def health():
+        return jsonify(bot_status), 200
+
+    return app
+
+
+if __name__ == "__main__":
+    import threading
+
+    threading.Thread(target=run_bot_loop, daemon=True).start()
+
+    port = int(os.environ.get("PORT", 5000))
+    app = create_app()
+    app.run(host="0.0.0.0", port=port)
