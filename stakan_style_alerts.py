@@ -22,6 +22,28 @@ alert on either of these signals:
                    continuation alerts less frequent. Useful for trend-
                    following instead of catching reversals.
 
+  REVERSAL / CONTINUATION + VOLUME DROP - the mirror signal family. Same
+                   direction logic as above (flip or continuation), but
+                   triggered when volume over the last hour has DROPPED
+                   to at most 1/FLIP_VOLUME_DROP_MULTIPLIER (reversals) or
+                   1/CONTINUATION_VOLUME_DROP_MULTIPLIER (continuations)
+                   of the hour before - i.e. the move is happening on
+                   fading conviction, a classic exhaustion warning.
+                   Labeled "(low volume)" in the alert to distinguish
+                   from the volume-spike versions, with its own cooldown
+                   so the two families don't interfere with each other.
+
+  All four signal types apply the same two guardrails to stay gentle
+  and avoid over-firing:
+    - 2-tick confirmation: the last two poll intervals must agree on
+      direction before a flip/continuation is trusted at all - a single
+      noisy tick can't trigger anything on its own.
+    - Extension filter (EXTENSION_BUFFER_PCT): a trade is skipped if
+      price is already sitting within that fraction of the lookback
+      window's extreme in the direction that would mean chasing (e.g.
+      a BUY-type signal skips if price is already near the window
+      high) - this avoids entries right at an already-exhausted point.
+
 HOW VOLUME IS MEASURED
 -----------------------
 Earlier versions of this script estimated volume by diffing Binance's
@@ -87,6 +109,12 @@ FLIP_LOOKBACK_MINUTES = 30                 # how far back to judge the prior tre
 MIN_TREND_PCT_FOR_CANDIDATE = 1.0          # ignore noise: trend must move at least this % before checking volume
 FLIP_VOLUME_MULTIPLIER = 2.0               # last 1h real volume vs the 1h just before it, for reversal alerts
 CONTINUATION_VOLUME_MULTIPLIER = 3.0       # stricter volume bar for continuation alerts specifically
+# Mirror signal: volume DROPPING (not spiking) during a flip/continuation can
+# signal fading conviction / exhaustion. Same direction logic, opposite
+# volume condition. Thresholds mirror the spike ones (2x drop, 3x drop) so
+# both signal families are equally strict.
+FLIP_VOLUME_DROP_MULTIPLIER = 2.0          # last 1h volume must be at most 1/2.0 of the prior hour
+CONTINUATION_VOLUME_DROP_MULTIPLIER = 3.0  # last 1h volume must be at most 1/3.0 of the prior hour
 EXTENSION_BUFFER_PCT = 0.15                 # skip trades already within this fraction of the window's extreme
                                              # (avoids buying near the top / selling near the bottom of an
                                              # already-exhausted move - the classic "reverses right after
@@ -434,10 +462,17 @@ def process_cycle(symbols):
                 return position_in_range >= (1 - EXTENSION_BUFFER_PCT)
             return position_in_range <= EXTENSION_BUFFER_PCT
 
+        if multiplier >= 1:
+            volume_desc = f"volume {multiplier:.1f}x vs prior hour"
+        elif multiplier > 0:
+            volume_desc = f"volume dropped {1 / multiplier:.1f}x vs prior hour"
+        else:
+            volume_desc = "volume dropped to near zero vs prior hour"
+
         range_str = (
             f"{FLIP_LOOKBACK_MINUTES}m range {c['window_low']:g}-{c['window_high']:g}, "
             f"trend {c['trend_pct']:+.2f}%, last tick {c['momentum_pct']:+.2f}%, "
-            f"volume {multiplier:.1f}x vs prior hour"
+            f"{volume_desc}"
         )
 
         def build_chart():
@@ -460,6 +495,19 @@ def process_cycle(symbols):
                     f"{FLIP_LOOKBACK_MINUTES}m (now {c['last_price']:g})\n{range_str}",
                     build_chart(),
                 ))
+        elif is_reversal and multiplier <= (1 / FLIP_VOLUME_DROP_MULTIPLIER):
+            if c["trend_sign"] > 0 and not too_extended("down") and can_alert(symbol, "flip_sell_lowvol"):
+                alerts.append((
+                    f"🔴🔕 SELL (low volume) <b>{symbol}</b>: green→red flip after trending up over "
+                    f"{FLIP_LOOKBACK_MINUTES}m, volume drying up (now {c['last_price']:g})\n{range_str}",
+                    build_chart(),
+                ))
+            elif c["trend_sign"] < 0 and not too_extended("up") and can_alert(symbol, "flip_buy_lowvol"):
+                alerts.append((
+                    f"🟢🔕 BUY (low volume) <b>{symbol}</b>: red→green flip after trending down over "
+                    f"{FLIP_LOOKBACK_MINUTES}m, volume drying up (now {c['last_price']:g})\n{range_str}",
+                    build_chart(),
+                ))
         elif is_continuation and multiplier >= CONTINUATION_VOLUME_MULTIPLIER:
             if c["trend_sign"] > 0 and not too_extended("up") and can_alert(symbol, "continue_up"):
                 alerts.append((
@@ -471,6 +519,19 @@ def process_cycle(symbols):
                 alerts.append((
                     f"🟥 CONTINUATION DOWN <b>{symbol}</b>: still falling after "
                     f"{FLIP_LOOKBACK_MINUTES}m downtrend (now {c['last_price']:g})\n{range_str}",
+                    build_chart(),
+                ))
+        elif is_continuation and multiplier <= (1 / CONTINUATION_VOLUME_DROP_MULTIPLIER):
+            if c["trend_sign"] > 0 and not too_extended("up") and can_alert(symbol, "continue_up_lowvol"):
+                alerts.append((
+                    f"🟩🔕 CONTINUATION UP (low volume) <b>{symbol}</b>: still rising after "
+                    f"{FLIP_LOOKBACK_MINUTES}m uptrend, volume drying up (now {c['last_price']:g})\n{range_str}",
+                    build_chart(),
+                ))
+            elif c["trend_sign"] < 0 and not too_extended("down") and can_alert(symbol, "continue_down_lowvol"):
+                alerts.append((
+                    f"🟥🔕 CONTINUATION DOWN (low volume) <b>{symbol}</b>: still falling after "
+                    f"{FLIP_LOOKBACK_MINUTES}m downtrend, volume drying up (now {c['last_price']:g})\n{range_str}",
                     build_chart(),
                 ))
 
