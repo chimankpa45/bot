@@ -33,7 +33,7 @@ alert on either of these signals:
                    from the volume-spike versions, with its own cooldown
                    so the two families don't interfere with each other.
 
-  All four signal types apply the same two guardrails to stay gentle
+  All signal types apply the same three guardrails to stay gentle
   and avoid over-firing:
     - 2-tick confirmation: the last two poll intervals must agree on
       direction before a flip/continuation is trusted at all - a single
@@ -43,6 +43,12 @@ alert on either of these signals:
       window's extreme in the direction that would mean chasing (e.g.
       a BUY-type signal skips if price is already near the window
       high) - this avoids entries right at an already-exhausted point.
+    - Cross-exchange confirmation (REQUIRE_BYBIT_CONFIRMATION): before
+      firing, Bybit's own candles for the same symbol/window are checked.
+      If Bybit's trend and momentum direction don't agree with Binance's,
+      or the pair isn't available on Bybit, the alert is skipped - this
+      filters out single-exchange wicks or manipulation that don't
+      reflect the broader market.
 
 HOW VOLUME IS MEASURED
 -----------------------
@@ -124,9 +130,19 @@ ALERT_COOLDOWN_SECONDS = 30 * 60           # don't re-alert same symbol+reason w
 KLINE_INTERVAL = "5m"                      # candle size used for the real-volume check
 KLINE_CANDLES_NEEDED = 24                  # 24 x 5m = 2h of candles (last 1h vs previous 1h)
 
+# Cross-exchange confirmation: before firing any alert, also check Bybit's
+# own candles for the same symbol and window. If Bybit's price direction
+# (trend + momentum) doesn't agree with Binance's, or Bybit data isn't
+# available for that pair, the alert is skipped rather than fired on
+# Binance alone - this filters out single-exchange wicks/manipulation that
+# don't reflect the broader market.
+REQUIRE_BYBIT_CONFIRMATION = True
+BYBIT_KLINE_INTERVAL = "5"                 # Bybit uses bare minutes, not "5m"
+
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr"
 BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BYBIT_KLINES_URL = "https://api.bybit.com/v5/market/kline"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -216,6 +232,57 @@ def fetch_real_volume_multiplier(symbol: str):
         return None, last_1h_volume, prev_1h_volume, candles
 
     return last_1h_volume / prev_1h_volume, last_1h_volume, prev_1h_volume, candles
+
+
+def fetch_bybit_confirmation(symbol: str):
+    """
+    Independent direction check on Bybit for the same symbol and window,
+    used to confirm a Binance-detected signal isn't a single-exchange wick.
+    Returns (trend_sign, momentum_sign) computed from Bybit's own candles,
+    or (None, None) if the pair isn't on Bybit or the data is unusable.
+    """
+    try:
+        resp = requests.get(
+            BYBIT_KLINES_URL,
+            params={
+                "category": "spot",
+                "symbol": symbol,
+                "interval": BYBIT_KLINE_INTERVAL,
+                "limit": KLINE_CANDLES_NEEDED,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        log.warning("Bybit kline fetch failed for %s: %s", symbol, e)
+        return None, None
+
+    if data.get("retCode") != 0:
+        log.warning("Bybit kline error for %s: %s", symbol, data.get("retMsg"))
+        return None, None
+
+    rows = data.get("result", {}).get("list", [])
+    if len(rows) < KLINE_CANDLES_NEEDED:
+        return None, None
+
+    # Bybit returns newest-first; sort ascending by start time to be safe
+    rows = sorted(rows, key=lambda r: int(r[0]))
+    closes = [float(r[4]) for r in rows]
+
+    window_start_price = closes[0]
+    prev_price = closes[-2]
+    last_price = closes[-1]
+
+    if window_start_price <= 0 or prev_price <= 0:
+        return None, None
+
+    trend_change = prev_price - window_start_price
+    momentum_change = last_price - prev_price
+    trend_sign = 1 if trend_change > 0 else (-1 if trend_change < 0 else 0)
+    momentum_sign = 1 if momentum_change > 0 else (-1 if momentum_change < 0 else 0)
+
+    return trend_sign, momentum_sign
 
 
 def generate_chart_image(symbol: str, candles) -> bytes:
@@ -442,6 +509,19 @@ def process_cycle(symbols):
         if multiplier is None:
             continue
 
+        if REQUIRE_BYBIT_CONFIRMATION:
+            bybit_trend_sign, bybit_momentum_sign = fetch_bybit_confirmation(symbol)
+            if bybit_trend_sign is None or bybit_momentum_sign is None:
+                log.info("Skipping %s: no Bybit data to cross-confirm.", symbol)
+                continue
+            if bybit_trend_sign != c["trend_sign"] or bybit_momentum_sign != c["momentum_sign"]:
+                log.info(
+                    "Skipping %s: Bybit disagrees with Binance direction "
+                    "(Binance trend=%s momentum=%s, Bybit trend=%s momentum=%s).",
+                    symbol, c["trend_sign"], c["momentum_sign"], bybit_trend_sign, bybit_momentum_sign,
+                )
+                continue
+
         is_reversal = c["trend_sign"] != c["momentum_sign"]
         is_continuation = c["trend_sign"] == c["momentum_sign"]
 
@@ -474,6 +554,8 @@ def process_cycle(symbols):
             f"trend {c['trend_pct']:+.2f}%, last tick {c['momentum_pct']:+.2f}%, "
             f"{volume_desc}"
         )
+        if REQUIRE_BYBIT_CONFIRMATION:
+            range_str += "\n✅ Confirmed on Binance + Bybit"
 
         def build_chart():
             try:
