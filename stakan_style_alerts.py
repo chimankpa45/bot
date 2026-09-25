@@ -291,8 +291,10 @@ def generate_chart_image(symbol: str, candles) -> bytes:
     the same kline data already used for the volume check. Green if price
     rose over the shown window, red if it fell.
 
-    The bottom "Dynamics" panel is a real candlestick strip (open/high/low/
-    close) colored and brightened by actual buy-vs-sell volume delta for
+    The bottom "Dynamics" panel is a bar chart - same baseline/orientation
+    as the Volume panel above it, not a price-level candlestick - where
+    each bar's height is the size of that candle's buy-vs-sell volume
+    delta, colored and brightened by actual buy-vs-sell volume delta for
     that candle, not by price change - matching stakan's actual logic:
     sharp buy or sell IMBALANCE (delta) drives the color/brightness, not
     the size of the price move itself. Binance kline data includes taker
@@ -300,9 +302,6 @@ def generate_chart_image(symbol: str, candles) -> bytes:
     extra API calls needed.
     """
     times = [datetime.fromtimestamp(c[0] / 1000) for c in candles]
-    opens = [float(c[1]) for c in candles]
-    highs = [float(c[2]) for c in candles]
-    lows = [float(c[3]) for c in candles]
     closes = [float(c[4]) for c in candles]
     volumes = [float(c[5]) for c in candles]
     taker_buy_volumes = [float(c[9]) for c in candles]
@@ -329,14 +328,13 @@ def generate_chart_image(symbol: str, candles) -> bytes:
     ax2.bar(times, volumes, width=0.003, color=bar_color)
     ax2.set_ylabel("Volume", color="#94a3b8", fontsize=7)
 
-    # candlestick dynamics panel: real OHLC shape (wick + body), but color
-    # and brightness are driven by buy/sell volume DELTA for that candle,
-    # not price change - net buying = green, net selling = red, and the
-    # more one-sided the delta, the more vivid it renders. Brightness is
-    # encoded as an actual dim-to-vivid color blend (not transparency,
-    # which is too subtle to read against a dark background), and a sqrt
-    # curve spreads out mid-strength deltas instead of clustering them
-    # near "dim."
+    # dynamics panel: a bar chart, same plane/orientation as Volume above -
+    # bar height is the SIZE of that candle's buy-vs-sell delta (not price),
+    # color is direction (green = net buy, red = net sell), and brightness
+    # is how one-sided that delta was. Brightness is an actual dim-to-vivid
+    # color blend (not transparency, which is too subtle to read against a
+    # dark background), with a sqrt curve so mid-strength deltas spread out
+    # instead of clustering near "dim."
     deltas = [
         (2 * buy_vol - total_vol)  # buy_vol - (total_vol - buy_vol)
         for buy_vol, total_vol in zip(taker_buy_volumes, volumes)
@@ -351,12 +349,14 @@ def generate_chart_image(symbol: str, candles) -> bytes:
     def blend(dim, vivid, t):
         return tuple(dim[i] + (vivid[i] - dim[i]) * t for i in range(3))
 
-    for t, o, h, l, cl, delta in zip(times, opens, highs, lows, closes, deltas):
-        ratio = (abs(delta) / max_abs_delta) if max_abs_delta > 0 else 0.0
+    bar_heights = [abs(d) for d in deltas]
+    bar_colors = []
+    for d in deltas:
+        ratio = (abs(d) / max_abs_delta) if max_abs_delta > 0 else 0.0
         ratio = ratio ** 0.5  # sqrt curve: spreads mid-range deltas apart for readability
-        candle_color = blend(DIM_GREEN, VIVID_GREEN, ratio) if delta >= 0 else blend(DIM_RED, VIVID_RED, ratio)
-        ax3.plot([t, t], [l, h], color=candle_color, linewidth=1)
-        ax3.plot([t, t], [o, cl], color=candle_color, linewidth=4, solid_capstyle="butt")
+        bar_colors.append(blend(DIM_GREEN, VIVID_GREEN, ratio) if d >= 0 else blend(DIM_RED, VIVID_RED, ratio))
+
+    ax3.bar(times, bar_heights, width=0.003, color=bar_colors)
     ax3.set_ylabel("Dynamics", color="#94a3b8", fontsize=7)
 
     fig.autofmt_xdate(rotation=30)
