@@ -62,11 +62,22 @@ This version fixes that with a two-stage approach:
   1. Every cycle, one cheap call (`/api/v3/ticker/24hr`, all symbols at
      once) tracks price only, and finds symbols with a real price trend
      or flip - this part is free and instant.
-  2. Only for those few candidates, a real 5-minute kline is fetched
+  2. Only for those few candidates, real 5-minute klines are fetched
      (`/api/v3/klines`) - kline volume is the true volume traded in that
-     exact window, not a rolling estimate - to confirm the volume spike
-     before alerting. This keeps API usage low (a handful of calls per
-     cycle, not 480) while giving accurate volume data.
+     exact window, not a rolling estimate.
+
+Volume is checked with TWO independent comparisons, both of which must
+agree (both spike, or both drop) before a volume-based alert fires:
+  - Prior 1h vs Last 1h: the hour before the last hour, compared to the
+    last hour - the original hour-over-hour comparison.
+  - Now vs Last 1h: the last LIVE_WINDOW_MINUTES of trading (still
+    forming), projected to an hourly-equivalent rate, compared to the
+    last complete hour - catches a spike or drop happening RIGHT NOW,
+    not just a pattern between two already-finished hours.
+Requiring both keeps this efficient (a handful of calls per cycle, not
+480) while making sure a signal reflects a real, sustained shift rather
+than a stale hour-over-hour pattern with no live follow-through, or a
+brief live blip with no broader support.
 
 SETUP (local testing)
 ----------------------
@@ -128,7 +139,15 @@ EXTENSION_BUFFER_PCT = 0.15                 # skip trades already within this fr
 
 ALERT_COOLDOWN_SECONDS = 30 * 60           # don't re-alert same symbol+reason within this window
 KLINE_INTERVAL = "5m"                      # candle size used for the real-volume check
+KLINE_CANDLE_MINUTES = 5                   # must match KLINE_INTERVAL
 KLINE_CANDLES_NEEDED = 24                  # 24 x 5m = 2h of candles (last 1h vs previous 1h)
+
+# "Now" / live volume window: the most recent few candles, used to catch a
+# spike or drop that is happening RIGHT NOW, not just comparing two already-
+# completed hours to each other. Its volume is projected to an hourly-
+# equivalent rate so it's comparable to the last full hour's total.
+LIVE_WINDOW_MINUTES = 15                   # how far back "current trading volume" looks
+LIVE_WINDOW_CANDLES = LIVE_WINDOW_MINUTES // KLINE_CANDLE_MINUTES
 
 # Cross-exchange confirmation: before firing any alert, also check Bybit's
 # own candles for the same symbol and window. If Bybit's price direction
@@ -205,9 +224,23 @@ def fetch_all_tickers():
 def fetch_real_volume_multiplier(symbol: str):
     """
     Real volume check using actual candle data (not a rolling-window
-    estimate). Returns (multiplier, last_1h_volume, prev_1h_volume, candles)
-    or (None, None, None, None) if unavailable. Candles are returned too so
-    the same fetch can be reused to draw a chart, instead of fetching twice.
+    estimate). Computes TWO independent comparisons:
+
+      1. prior_vs_last: the hour before the last hour, vs the last hour
+         (two already-completed windows compared to each other - the
+         original comparison).
+      2. now_vs_last: the last LIVE_WINDOW_MINUTES of trading (still
+         forming), projected to an hourly-equivalent rate, vs the last
+         complete hour - catches a spike or drop happening RIGHT NOW,
+         not just a pattern between two already-finished hours.
+
+    Returns (prior_vs_last_multiplier, now_vs_last_multiplier,
+    prior_1h_volume, last_1h_volume, now_volume_hourly_rate, candles) -
+    the three raw volume figures are included (not just the two ratios)
+    so callers can show the full prior -> last -> now progression and
+    its shape, not just isolated multipliers. Multipliers and the now
+    figure are None if unavailable. Candles are returned too so the same
+    fetch can be reused to draw a chart, instead of fetching twice.
     """
     try:
         resp = binance_get(
@@ -218,20 +251,29 @@ def fetch_real_volume_multiplier(symbol: str):
         candles = resp.json()
     except requests.RequestException as e:
         log.warning("Kline fetch failed for %s: %s", symbol, e)
-        return None, None, None, None
+        return None, None, None, None, None, None
 
     if len(candles) < KLINE_CANDLES_NEEDED:
-        return None, None, None, None
+        return None, None, None, None, None, None
 
     volumes = [float(c[5]) for c in candles]
     half = KLINE_CANDLES_NEEDED // 2
-    prev_1h_volume = sum(volumes[:half])
+    prior_1h_volume = sum(volumes[:half])
     last_1h_volume = sum(volumes[half:])
 
-    if prev_1h_volume <= 0:
-        return None, last_1h_volume, prev_1h_volume, candles
+    prior_vs_last_multiplier = (last_1h_volume / prior_1h_volume) if prior_1h_volume > 0 else None
 
-    return last_1h_volume / prev_1h_volume, last_1h_volume, prev_1h_volume, candles
+    now_vs_last_multiplier = None
+    now_volume_hourly_rate = None
+    if LIVE_WINDOW_CANDLES > 0 and last_1h_volume > 0:
+        now_volume = sum(volumes[-LIVE_WINDOW_CANDLES:])
+        now_volume_hourly_rate = now_volume * (60 / LIVE_WINDOW_MINUTES)
+        now_vs_last_multiplier = now_volume_hourly_rate / last_1h_volume
+
+    return (
+        prior_vs_last_multiplier, now_vs_last_multiplier,
+        prior_1h_volume, last_1h_volume, now_volume_hourly_rate, candles
+    )
 
 
 def fetch_bybit_confirmation(symbol: str):
@@ -505,8 +547,11 @@ def process_cycle(symbols):
 
     for c in candidates:
         symbol = c["symbol"]
-        multiplier, last_1h_vol, prev_1h_vol, candles = fetch_real_volume_multiplier(symbol)
-        if multiplier is None:
+        (
+            prior_multiplier, now_multiplier,
+            prior_1h_vol, last_1h_vol, now_hourly_vol, candles
+        ) = fetch_real_volume_multiplier(symbol)
+        if prior_multiplier is None or now_multiplier is None:
             continue
 
         if REQUIRE_BYBIT_CONFIRMATION:
@@ -525,6 +570,24 @@ def process_cycle(symbols):
         is_reversal = c["trend_sign"] != c["momentum_sign"]
         is_continuation = c["trend_sign"] == c["momentum_sign"]
 
+        # both comparisons must independently agree - prior-hour-vs-last-hour
+        # AND the live/now pace vs last hour - before a volume condition is
+        # considered confirmed. This catches a real, sustained shift instead
+        # of one comparison alone (e.g. a stale hour-over-hour pattern with
+        # no live follow-through, or a live blip with no broader support).
+        flip_spike_confirmed = prior_multiplier >= FLIP_VOLUME_MULTIPLIER and now_multiplier >= FLIP_VOLUME_MULTIPLIER
+        flip_drop_confirmed = (
+            prior_multiplier <= (1 / FLIP_VOLUME_DROP_MULTIPLIER)
+            and now_multiplier <= (1 / FLIP_VOLUME_DROP_MULTIPLIER)
+        )
+        continuation_spike_confirmed = (
+            prior_multiplier >= CONTINUATION_VOLUME_MULTIPLIER and now_multiplier >= CONTINUATION_VOLUME_MULTIPLIER
+        )
+        continuation_drop_confirmed = (
+            prior_multiplier <= (1 / CONTINUATION_VOLUME_DROP_MULTIPLIER)
+            and now_multiplier <= (1 / CONTINUATION_VOLUME_DROP_MULTIPLIER)
+        )
+
         # extension check: is this entry already too close to the recent
         # extreme (i.e. the move looks exhausted rather than fresh)?
         window_range = c["window_high"] - c["window_low"]
@@ -542,16 +605,49 @@ def process_cycle(symbols):
                 return position_in_range >= (1 - EXTENSION_BUFFER_PCT)
             return position_in_range <= EXTENSION_BUFFER_PCT
 
-        if multiplier >= 1:
-            volume_desc = f"volume {multiplier:.1f}x vs prior hour"
-        elif multiplier > 0:
-            volume_desc = f"volume dropped {1 / multiplier:.1f}x vs prior hour"
+        def describe_multiplier(m: float) -> str:
+            if m >= 1:
+                return f"{m:.1f}x"
+            elif m > 0:
+                return f"dropped {1 / m:.1f}x"
+            return "near zero"
+
+        def format_volume(v: float) -> str:
+            if v >= 1_000_000:
+                return f"{v / 1_000_000:.2f}M"
+            elif v >= 1_000:
+                return f"{v / 1_000:.1f}K"
+            return f"{v:.0f}"
+
+        # shape of the progression: did volume move the same direction both
+        # steps (steadily rising/falling), or reverse partway (rise then
+        # drop, or drop then rise)?
+        step1_up = last_1h_vol > prior_1h_vol
+        step1_down = last_1h_vol < prior_1h_vol
+        step2_up = now_hourly_vol > last_1h_vol
+        step2_down = now_hourly_vol < last_1h_vol
+
+        if step1_up and step2_up:
+            shape_label = "📈📈 rising steadily"
+        elif step1_down and step2_down:
+            shape_label = "📉📉 falling steadily"
+        elif step1_up and step2_down:
+            shape_label = "📈📉 rose then dropped"
+        elif step1_down and step2_up:
+            shape_label = "📉📈 dropped then rising"
         else:
-            volume_desc = "volume dropped to near zero vs prior hour"
+            shape_label = "➡️ roughly flat"
+
+        volume_desc = (
+            f"Volume: {format_volume(prior_1h_vol)} → {format_volume(last_1h_vol)} → "
+            f"{format_volume(now_hourly_vol)} (prior → last hour → now)\n"
+            f"{shape_label} — Prior vs Last: {describe_multiplier(prior_multiplier)}, "
+            f"Now vs Last: {describe_multiplier(now_multiplier)}"
+        )
 
         range_str = (
             f"{FLIP_LOOKBACK_MINUTES}m range {c['window_low']:g}-{c['window_high']:g}, "
-            f"trend {c['trend_pct']:+.2f}%, last tick {c['momentum_pct']:+.2f}%, "
+            f"trend {c['trend_pct']:+.2f}%, last tick {c['momentum_pct']:+.2f}%\n"
             f"{volume_desc}"
         )
         if REQUIRE_BYBIT_CONFIRMATION:
@@ -564,7 +660,7 @@ def process_cycle(symbols):
                 log.warning("Chart generation failed for %s: %s", symbol, e)
                 return None
 
-        if is_reversal and multiplier >= FLIP_VOLUME_MULTIPLIER:
+        if is_reversal and flip_spike_confirmed:
             if c["trend_sign"] > 0 and not too_extended("down") and can_alert(symbol, "flip_sell"):
                 alerts.append((
                     f"🔴 SELL <b>{symbol}</b>: green→red flip after trending up over "
@@ -577,7 +673,7 @@ def process_cycle(symbols):
                     f"{FLIP_LOOKBACK_MINUTES}m (now {c['last_price']:g})\n{range_str}",
                     build_chart(),
                 ))
-        elif is_reversal and multiplier <= (1 / FLIP_VOLUME_DROP_MULTIPLIER):
+        elif is_reversal and flip_drop_confirmed:
             if c["trend_sign"] > 0 and not too_extended("down") and can_alert(symbol, "flip_sell_lowvol"):
                 alerts.append((
                     f"🔴🔕 SELL (low volume) <b>{symbol}</b>: green→red flip after trending up over "
@@ -590,7 +686,7 @@ def process_cycle(symbols):
                     f"{FLIP_LOOKBACK_MINUTES}m, volume drying up (now {c['last_price']:g})\n{range_str}",
                     build_chart(),
                 ))
-        elif is_continuation and multiplier >= CONTINUATION_VOLUME_MULTIPLIER:
+        elif is_continuation and continuation_spike_confirmed:
             if c["trend_sign"] > 0 and not too_extended("up") and can_alert(symbol, "continue_up"):
                 alerts.append((
                     f"🟩 CONTINUATION UP <b>{symbol}</b>: still rising after "
@@ -603,7 +699,7 @@ def process_cycle(symbols):
                     f"{FLIP_LOOKBACK_MINUTES}m downtrend (now {c['last_price']:g})\n{range_str}",
                     build_chart(),
                 ))
-        elif is_continuation and multiplier <= (1 / CONTINUATION_VOLUME_DROP_MULTIPLIER):
+        elif is_continuation and continuation_drop_confirmed:
             if c["trend_sign"] > 0 and not too_extended("up") and can_alert(symbol, "continue_up_lowvol"):
                 alerts.append((
                     f"🟩🔕 CONTINUATION UP (low volume) <b>{symbol}</b>: still rising after "
