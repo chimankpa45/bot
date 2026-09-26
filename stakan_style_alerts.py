@@ -2,7 +2,8 @@
 Stakan-style crypto alert bot
 =============================
 
-Monitors ALL Binance USDT spot pairs every 30 seconds and sends a Telegram
+Monitors ALL Binance USDT-M perpetual futures pairs every 30 seconds and
+sends a Telegram
 alert on either of these signals:
 
   REVERSAL + VOLUME     - price was trending green (up) over the last
@@ -157,10 +158,13 @@ LIVE_WINDOW_CANDLES = LIVE_WINDOW_MINUTES // KLINE_CANDLE_MINUTES
 # don't reflect the broader market.
 REQUIRE_BYBIT_CONFIRMATION = True
 BYBIT_KLINE_INTERVAL = "5"                 # Bybit uses bare minutes, not "5m"
+BYBIT_CATEGORY = "linear"                  # Bybit USDT perpetual futures (was "spot")
 
-BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr"
-BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+# USDT-M futures endpoints (was spot /api/v3/... - switched since the user
+# trades futures, not spot; symbol lists, price and volume all differ).
+BINANCE_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+BINANCE_EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 BYBIT_KLINES_URL = "https://api.bybit.com/v5/market/kline"
 
 logging.basicConfig(
@@ -201,7 +205,7 @@ def binance_get(url, params=None, timeout=15):
 
 
 def get_usdt_symbols():
-    """Fetch all actively trading spot USDT pairs."""
+    """Fetch all actively trading USDT-M perpetual futures pairs."""
     resp = binance_get(BINANCE_EXCHANGE_INFO_URL, timeout=15)
     data = resp.json()
     symbols = set()
@@ -209,7 +213,7 @@ def get_usdt_symbols():
         if (
             s["quoteAsset"] == "USDT"
             and s["status"] == "TRADING"
-            and s["isSpotTradingAllowed"]
+            and s.get("contractType") == "PERPETUAL"
         ):
             symbols.add(s["symbol"])
     return symbols
@@ -287,7 +291,7 @@ def fetch_bybit_confirmation(symbol: str):
         resp = requests.get(
             BYBIT_KLINES_URL,
             params={
-                "category": "spot",
+                "category": BYBIT_CATEGORY,
                 "symbol": symbol,
                 "interval": BYBIT_KLINE_INTERVAL,
                 "limit": KLINE_CANDLES_NEEDED,
